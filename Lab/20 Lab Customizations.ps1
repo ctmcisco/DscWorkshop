@@ -3,6 +3,17 @@ $lab = Get-Lab
 $dc = Get-LabVM -Role ADDS | Select-Object -First 1
 $domainName = $lab.Domains[0].Name
 $devOpsServer = Get-LabVM -Role AzDevOps
+$devOpsHostName = if ($lab.DefaultVirtualizationEngine -eq 'Azure') { $devOpsServer.AzureConnectionInfo.DnsName } else { $devOpsServer.FQDN }
+$devOpsRole = $devOpsServer.Roles | Where-Object Name -eq AzDevOps
+$devOpsPort = $originalPort = 8080
+if ($devOpsRole.Properties.ContainsKey('Port'))
+{
+    $devOpsPort = $devOpsRole.Properties['Port']
+}
+if ($lab.DefaultVirtualizationEngine -eq 'Azure')
+{
+    $devOpsPort = (Get-LabAzureLoadBalancedPort -DestinationPort $devOpsPort -ComputerName $devOpsServer).Port
+}
 $buildWorkers = Get-LabVM -Role TfsBuildWorker
 $sqlServer = Get-LabVM -Role SQLServer2017
 $pullServer = Get-LabVM -Role DSCPullServer
@@ -33,30 +44,36 @@ $domainSid = Invoke-LabCommand -ActivityName 'Get domain SID' -ScriptBlock {
 $requiredModules = @{
     'powershell-yaml'            = 'latest'
     BuildHelpers                 = 'latest'
-    datum                        = 'latest'
+    datum                        = '0.0.38'
     DscBuildHelpers              = 'latest'
     InvokeBuild                  = 'latest'
-    Pester                       = 'latest'
+    Pester                       = '4.10.1'
     ProtectedData                = 'latest'
     PSDepend                     = 'latest'
     PSDeploy                     = 'latest'
     PSScriptAnalyzer             = 'latest'
     xDSCResourceDesigner         = 'latest'
     xPSDesiredStateConfiguration = '9.1.0'
-    ComputerManagementDsc        = '8.2.0'
-    NetworkingDsc                = '7.4.0.0'
+    ComputerManagementDsc        = '8.4.0'
+    NetworkingDsc                = '8.1.0'
     NTFSSecurity                 = 'latest'
-    JeaDsc                       = '0.6.5'
+    JeaDsc                       = '0.7.1'
     XmlContentDsc                = '0.0.1'
     PowerShellGet                = 'latest'
     PackageManagement            = 'latest'
-    xWebAdministration           = '3.1.1'
-    ActiveDirectoryDsc           = '5.0.0'
+    xWebAdministration           = '3.2.0'
+    ActiveDirectoryDsc           = '6.0.1'
     SecurityPolicyDsc            = '2.10.0.0'
-    StorageDsc                   = '5.0.0'
+    StorageDsc                   = '5.0.1'
     Chocolatey                   = '0.0.79'
     'Datum.ProtectedData'        = '0.0.1'
+    'Datum.InvokeCommand'        = '0.1.1'
     xDscDiagnostics              = '2.8.0'
+    CertificateDsc               = '4.7.0.0'
+    DfsDsc                       = '4.4.0.0'
+    WdsDsc                       = '0.11.0'
+    xDhcpServer                  = '2.0.0.0'
+
 }
 
 $requiredChocolateyPackages = @{
@@ -80,9 +97,20 @@ $feedPermissions += (New-Object pscustomobject -Property @{ role = 'contributor'
 $feedPermissions += (New-Object pscustomobject -Property @{ role = 'contributor'; identityDescriptor = "System.Security.Principal.WindowsIdentity;$domainSid-515" })
 $feedPermissions += (New-Object pscustomobject -Property @{ role = 'reader'; identityDescriptor = 'System.Security.Principal.WindowsIdentity;S-1-5-7' })
 
-$powerShellFeed = New-LabTfsFeed -ComputerName $nugetServer -FeedName PowerShell -FeedPermissions $feedPermissions -PassThru -ErrorAction Stop
+$powerShellFeed = Get-LabTfsFeed -ComputerName $nugetServer -FeedName PowerShell -ErrorAction SilentlyContinue
+if (-not $powerShellFeed)
+{
+    $powerShellFeed = New-LabTfsFeed -ComputerName $nugetServer -FeedName PowerShell -FeedPermissions $feedPermissions -PassThru -ErrorAction Stop
+}
+$replace = '$1{0}${{Separator}}{1}$4' -f $devOpsServer.Name, $originalPort
+$powerShellFeed.NugetV2Url = $powerShellFeed.NugetV2Url -replace '(https:\/\/)([\w\.]+)(?<Separator>:)(\d{2,4})(.+)', $replace
 Write-Host "Created artifacts feed 'PowerShell' on Azure DevOps Server '$nugetServer'"
-$chocolateyFeed = New-LabTfsFeed -ComputerName $nugetServer -FeedName Software -FeedPermissions $feedPermissions -PassThru -ErrorAction Stop
+$chocolateyFeed = Get-LabTfsFeed -ComputerName $nugetServer -FeedName Software -ErrorAction SilentlyContinue
+if (-not $chocolateyFeed)
+{
+    $chocolateyFeed = New-LabTfsFeed -ComputerName $nugetServer -FeedName Software -FeedPermissions $feedPermissions -PassThru -ErrorAction Stop
+}
+$chocolateyFeed.NugetV2Url = $chocolateyFeed.NugetV2Url -replace '(https:\/\/)([\w\.]+)(?<Separator>:)(\d{2,4})(.+)', $replace
 Write-Host "Created artifacts feed 'Software' on Azure DevOps Server '$nugetServer'"
 
 # Web server
@@ -155,19 +183,19 @@ Invoke-LabCommand -ActivityName 'Create link on AzureDevOps desktop' -ComputerNa
     $shell = New-Object -ComObject WScript.Shell
     $desktopPath = [System.Environment]::GetFolderPath('Desktop')
     $shortcut = $shell.CreateShortcut("$desktopPath\DscWorkshop Project.url")
-    $shortcut.TargetPath = "https://$($devOpsServer):8080/AutomatedLab/DscWorkshop"
+    $shortcut.TargetPath = "https://$($devOpsServer):$($originalPort)/AutomatedLab/DscWorkshop"
     $shortcut.Save()
 
     $shortcut = $shell.CreateShortcut("$desktopPath\CommonTasks Project.url")
-    $shortcut.TargetPath = "https://$($devOpsServer):8080/AutomatedLab/CommonTasks"
+    $shortcut.TargetPath = "https://$($devOpsServer):$($originalPort)/AutomatedLab/CommonTasks"
     $shortcut.Save()
     
     $shortcut = $shell.CreateShortcut("$desktopPath\PowerShell Feed.url")
-    $shortcut.TargetPath = "https://$($devOpsServer):8080/AutomatedLab/_packaging?_a=feed&feed=$($powerShellFeed.name)"
+    $shortcut.TargetPath = "https://$($devOpsServer):$($originalPort)/AutomatedLab/_packaging?_a=feed&feed=$($powerShellFeed.name)"
     $shortcut.Save()
     
     $shortcut = $shell.CreateShortcut("$desktopPath\Chocolatey Feed.url")
-    $shortcut.TargetPath = "https://$($devOpsServer):8080/AutomatedLab/_packaging?_a=feed&feed=$($chocolateyFeed.name)"
+    $shortcut.TargetPath = "https://$($devOpsServer):$($originalPort)/AutomatedLab/_packaging?_a=feed&feed=$($chocolateyFeed.name)"
     $shortcut.Save()
     
     $shortcut = $shell.CreateShortcut("$desktopPath\SQL RS.url")
@@ -175,9 +203,9 @@ Invoke-LabCommand -ActivityName 'Create link on AzureDevOps desktop' -ComputerNa
     $shortcut.Save()
 
     $shortcut = $shell.CreateShortcut("$desktopPath\Pull Server Endpoint.url")
-    $shortcut.TargetPath = "https://$($pullServer.FQDN):8080/PSDSCPullServer.svc/"
+    $shortcut.TargetPath = "https://$($pullServer.FQDN):$($originalPort)/PSDSCPullServer.svc/"
     $shortcut.Save()
-} -Variable (Get-Variable -Name devOpsServer, sqlServer, powerShellFeed, chocolateyFeed, pullServer)
+} -Variable (Get-Variable -Name devOpsServer, sqlServer, powerShellFeed, chocolateyFeed, pullServer, originalPort)
 
 #in server 2019 there seems to be an issue with dynamic DNS registration, doing this manually
 foreach ($domain in (Get-Lab).Domains) {
